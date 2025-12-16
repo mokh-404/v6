@@ -604,3 +604,4 @@ Timestamp,CPU_Model,CPU_Cores,CPU_Usage,Mem_Total,Mem_Used,Mem_Percent,Disk_Perc
 20251216_032855,AMD Ryzen 7 7435HS                             ,16,16.98,23.82,11.21,47.06,96,54.9°C,NVIDIA GeForce RTX 2050
 20251216_032904,AMD Ryzen 7 7435HS                             ,16,15.77,23.82,11.22,47.10,96,53.9°C,NVIDIA GeForce RTX 2050
 20251216_032913,AMD Ryzen 7 7435HS                             ,16,14.34,23.82,11.29,47.40,96,53.9°C,NVIDIA GeForce RTX 2050
+20251216_032923,AMD Ryzen 7 7435HS                             ,16,14.61,23.82,10.98,46.10,96,52.9°C,NVIDIA GeForce RTX 2050
