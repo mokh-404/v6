@@ -1,0 +1,2 @@
+Timestamp,CPU_Model,CPU_Cores,CPU_Usage,Mem_Total,Mem_Used,Mem_Percent,Disk_Percent,Temp,GPU_Name
+20251215_164559,AMD Ryzen 7 7435HS                             ,16,7.74,23.82,18.16,76.23,96,47°C (GPU),NVIDIA GeForce RTX 2050
