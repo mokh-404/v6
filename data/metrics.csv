@@ -594,3 +594,13 @@ Timestamp,CPU_Model,CPU_Cores,CPU_Usage,Mem_Total,Mem_Used,Mem_Percent,Disk_Perc
 20251214_230048,12th Gen Intel(R) Core(TM) i5-12500H,16,0,23.63,12.86,54.42,61,N/A,NVIDIA GeForce RTX 3050 Laptop GPU
 20251214_230811,12th Gen Intel(R) Core(TM) i5-12500H,16,0,23.63,12.47,52.77,61,N/A,NVIDIA GeForce RTX 3050 Laptop GPU
 >>>>>>> fa9881ae04ef4b0fb17f94636f7c6f8a712acbbe
+20251216_032817,AMD Ryzen 7 7435HS                             ,16,0,23.82,11.09,46.56,96,56.9°C,NVIDIA GeForce RTX 2050
+20251216_032825,AMD Ryzen 7 7435HS                             ,16,9.65,23.82,11.07,46.47,96,55.9°C,NVIDIA GeForce RTX 2050
+20251216_032834,AMD Ryzen 7 7435HS                             ,16,15.27,23.82,11.18,46.94,96,53.9°C,NVIDIA GeForce RTX 2050
+20251216_032839,AMD Ryzen 7 7435HS                             ,16,0,23.82,11.27,47.31,96,61.9°C,NVIDIA GeForce RTX 2050
+20251216_032843,AMD Ryzen 7 7435HS                             ,16,17.32,23.82,11.29,47.40,96,58.9°C,NVIDIA GeForce RTX 2050
+20251216_032847,AMD Ryzen 7 7435HS                             ,16,17.53,23.82,11.16,46.85,96,63.9°C,NVIDIA GeForce RTX 2050
+20251216_032851,AMD Ryzen 7 7435HS                             ,16,18.11,23.82,11.21,47.06,96,58.9°C,NVIDIA GeForce RTX 2050
+20251216_032855,AMD Ryzen 7 7435HS                             ,16,16.98,23.82,11.21,47.06,96,54.9°C,NVIDIA GeForce RTX 2050
+20251216_032904,AMD Ryzen 7 7435HS                             ,16,15.77,23.82,11.22,47.10,96,53.9°C,NVIDIA GeForce RTX 2050
+20251216_032913,AMD Ryzen 7 7435HS                             ,16,14.34,23.82,11.29,47.40,96,53.9°C,NVIDIA GeForce RTX 2050

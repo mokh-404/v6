@@ -138,8 +138,7 @@ collect_cpu_metrics() {
     # -- CPU Temperature --
 
     local temp="N/A"
-<<<<<<< HEAD
-
+    
     # Strategy 0: "Anti-Gravity" Python Bridge (WSL Breakout / Unified)
     # Check for script existence in the same directory
     if command -v python3 >/dev/null 2>&1 && [ -f "${SCRIPT_DIR}/gravity_bridge.py" ]; then
@@ -156,15 +155,6 @@ collect_cpu_metrics() {
         [ -n "$t" ] && temp="${t}°C"
     fi
     # Strategy 2: /sys/class/thermal [Fallback]
-=======
-    
-    # Strategy 1: sensors (lm-sensors)
-    if command -v sensors >/dev/null 2>&1; then
-        local t=$(sensors | grep -E "Package id 0:|Core 0:" | head -1 | awk '{print $3}' | grep -o "[0-9.]*")
-        [ -n "$t" ] && temp="${t}°C"
-    fi
-    # Strategy 2: /sys/class/thermal
->>>>>>> fa9881ae04ef4b0fb17f94636f7c6f8a712acbbe
     if [ "$temp" == "N/A" ] && ls /sys/class/thermal/thermal_zone*/temp >/dev/null 2>&1; then
          # Try finding a zone with type "x86_pkg_temp" or similar positive value
          for zone in /sys/class/thermal/thermal_zone*; do
@@ -177,11 +167,7 @@ collect_cpu_metrics() {
              fi
          done
     fi
-<<<<<<< HEAD
     # Strategy 3: /sys/class/hwmon [Fallback]
-=======
-    # Strategy 3: /sys/class/hwmon
->>>>>>> fa9881ae04ef4b0fb17f94636f7c6f8a712acbbe
     if [ "$temp" == "N/A" ]; then
         for input in /sys/class/hwmon/hwmon*/temp*_input; do
             [ -f "$input" ] || continue
