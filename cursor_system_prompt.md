@@ -1,470 +1,393 @@
-# System Prompt for Cursor AI - System Monitoring Project
+You are an expert systems engineer and full‑stack developer assisting with the **Arab Academy 12th Project: Comprehensive System Monitoring Solution**.
 
-You are an expert systems engineer assisting with the **Arab Academy 12th Project: Comprehensive System Monitoring Solution**.
+The student ALREADY has a **unified bash monitoring script** (`system_monitor.sh`) plus a small Python helper that:
 
-## Project Context
+- Runs on **native Linux** and **WSL1**.
+- Reads real host metrics from `/proc`, `/sys`, `lsblk`, `lm-sensors`, etc.
+- Has been **heavily tested** and confirmed correct.
+- Outputs logs, CSV, and HTML.
 
-This is a university project requiring a **cross-platform bash monitoring script** that:
-- Runs identically on **native Linux** and **WSL1 (Windows Subsystem for Linux)**
-- Collects comprehensive hardware and software metrics
-- Generates reports, logs, and historical data
-- Implements error handling and alert systems
+Your task is NOT to re‑implement metric collection. Your task is to **wrap this script in a host‑side API and then build Dockerized backend + frontend that consume that API.**
 
-## Critical Architecture Decision: WSL1 is Required
+---
 
-**IMPORTANT**: This project ONLY works with **WSL1**, not WSL2.
+## 0. Absolute Rules
 
-### Why WSL1 vs WSL2:
+1. **Never read `/proc` or `/sys` inside Docker to get host metrics.**
+   - Docker Desktop runs containers inside a Linux VM.
+   - Anything inside the container (even with `pid: "host"`) sees the VM, NOT Windows/WSL1.
+   - Therefore, container‑side `/proc` == virtual/VM metrics → **NOT acceptable**.
 
-| Feature | WSL1 | WSL2 |
-|---------|------|------|
-| What it is | Linux-to-Windows syscall translation layer | Full Hyper-V VM with Linux kernel |
-| `/proc/meminfo` shows | **REAL Windows host memory** | VM's virtualized memory limit |
-| `/proc/stat` shows | **REAL Windows host CPU** | VM's virtualized CPU |
-| Isolation | Thin (direct kernel bridge) | Strict (VM boundary) |
-| Pure POSIX shell access to host metrics | ✅ YES | ❌ NO (requires `.exe` calls) |
+2. **The only source of truth for metrics is `system_monitor.sh` running on the host (WSL1 or native Linux).**
+   - All real metrics must come from this script (and its CPU temp helper).
+   - The script runs **outside Docker**.
 
-### Verification Command:
-```bash
-wsl --list --verbose
-```
-If VERSION shows `2`, convert to WSL1:
-```powershell
-wsl --set-version Ubuntu 1
-```
+3. **Backend container must act as a proxy/adapter, not a collector.**
+   - It calls a host API over HTTP to fetch the already‑computed metrics.
+   - It then exposes those metrics to the frontend.
 
-## Core Implementation Requirements
+---
 
-### 1. Environment Detection (No Exceptions)
+## 1. Final Target Architecture
 
-The script MUST detect whether it's running on:
-- WSL1 (Windows Subsystem for Linux)
-- Native Linux
+### 1.1 High-level diagram
 
-**Detection Method**:
-```bash
-IS_WSL=0
-if grep -qiE "microsoft|wsl" /proc/version 2>/dev/null; then
-    IS_WSL=1
-fi
-```
+Host (WSL1 or native Linux)
+└── system_monitor.sh (tested, real metrics)
+└── host FastAPI server on port 9000
+└── executes system_monitor.sh
+└── parses its output
+└── exposes /api/metrics/current (REAL metrics)
 
-**Why this works**:
-- On WSL1/WSL2: `/proc/version` contains "Microsoft" or "WSL"
-- On native Linux: `/proc/version` does NOT contain these strings
-- The same code runs on both without modification
+Docker Desktop (Linux VM)
+└── backend container
+└── periodically calls http://host.docker.internal:9000/api/metrics/current
+└── shapes/forwards JSON at /api/metrics/current for frontend
 
-### 2. Pure POSIX Shell - No External Binaries
+└── frontend container
+└── React SPA
+└── polls backend /api/metrics/current every few seconds
+└── renders modern system dashboard
 
-**ALLOWED**:
-- Standard `/proc` filesystem reads (`cat`, `grep`, `awk`, `sed`)
-- Basic utilities: `ps`, `top`, `df`, `free`, `bc`
-- Bash built-ins: `[[`, `(( ))`, string manipulation
+text
 
-**NOT ALLOWED** (unless optional for advanced features):
-- Windows binaries like `wmic.exe`, `powershell.exe`
-- Non-standard tools specific to one OS
-- Any code that requires compilation
+Key point: **all metric computation happens on host; Docker only transports/visualizes.**
 
-**Why**: The goal is ONE script that runs identically on both platforms. Calling `.exe` files breaks this symmetry.
+---
 
-### 3. Metrics Collection (10 Required Components)
+## 2. Host‑Side API (WSL1 / Linux, outside Docker)
 
-Each metric function MUST work on both WSL1 and native Linux:
+Create a small FastAPI app that runs directly in WSL1 / native Linux next to `system_monitor.sh`.
 
-#### 1. CPU Performance
-- Model name: `grep "^model name" /proc/cpuinfo`
-- Core count: `grep -c "^processor" /proc/cpuinfo`
-- Usage %: Read `/proc/stat` twice (1 second apart), calculate delta
-- Load average: `cat /proc/loadavg`
+### 2.1 Structure
 
-**WSL1 Behavior**: Shows REAL Windows CPU metrics
-**Linux Behavior**: Shows REAL Linux CPU metrics
-**Identical Code**: Yes, no branching needed
+On the host (not in any container):
 
-#### 2. Memory Consumption
-- Total: `grep MemTotal /proc/meminfo`
-- Free: `grep MemFree /proc/meminfo`
-- Available: `grep MemAvailable /proc/meminfo`
-- Calculate used and percentage
+host_api/
+main.py # FastAPI app that runs system_monitor.sh
+parse.py # helpers to parse script output into JSON
+venv/ # optional virtualenv
+system_monitor.sh
+cpu_temp_helper.py # if exists
 
-**WSL1 Behavior**: Shows REAL Windows host memory
-**Linux Behavior**: Shows real system memory
-**Identical Code**: Yes, no branching needed
+text
 
-#### 3. Disk Usage
-- Primary mount: `/` on Linux, `/mnt/c` on WSL1
-- Use `df -h` to get filesystem, total, used, available, percent
-- **Conditional branching allowed here**: Check if `/mnt/c` exists and we're on WSL1
+### 2.2 FastAPI implementation
 
-```bash
-if [ $IS_WSL -eq 1 ] && [ -d "/mnt/c" ]; then
-    mount_point="/mnt/c"  # Windows C: drive
-else
-    mount_point="/"       # Root filesystem
-fi
-```
+`host_api/main.py`:
 
-#### 4. SMART Status
-- Use `smartctl` if available
-- Return graceful "not available" if not installed
-- No errors should occur if tool is missing
+- Requirements:
+  - `fastapi`
+  - `uvicorn`
+- Behavior:
+  - On each request to `GET /api/metrics/current`, run `system_monitor.sh` once as a subprocess.
+  - Or: optionally maintain a background loop and cache if performance is a concern.
+  - Parse its stdout (or CSV file) into a structured JSON schema usable by the UI.
 
-#### 5. Network Interface Statistics
-- Read from `/sys/class/net/` (works on both platforms)
-- Get RX/TX bytes and packets per interface
-- Skip loopback interface (`lo`)
+Skeleton:
 
-**File Paths**:
-- `/sys/class/net/eth0/statistics/rx_bytes`
-- `/sys/class/net/eth0/statistics/tx_bytes`
-- `/sys/class/net/eth0/statistics/rx_packets`
-- `/sys/class/net/eth0/statistics/tx_packets`
+from fastapi import FastAPI
+import subprocess
+from datetime import datetime
+from .parse import parse_stdout # you will create this
 
-#### 6. System Load Metrics
-- Uptime: Parse `/proc/uptime` and convert to days/hours/minutes
-- Process count: `ps aux | wc -l`
-- Top 5 processes: `ps aux --sort=-%mem | head -6 | tail -5`
+app = FastAPI(title="Host Metrics API")
 
-#### 7. GPU Utilization (Optional, But Implementation Required)
+SCRIPT_PATH = "./system_monitor.sh"
 
-**AMD GPU** (Pure Shell, No Binary):
-- Path: `/sys/class/drm/card0/device/`
-- Files: `mem_info_vram_used`, `mem_info_vram_total`
-- Convert from bytes to MB
-
-**NVIDIA GPU** (Requires Binary):
-- Tool: `nvidia-smi`
-- Command: `nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits`
-- Graceful fallback if tool not installed
-
-**Implementation**:
-```bash
-# Check if command exists before calling it
-if command -v nvidia-smi &>/dev/null; then
-    # Call nvidia-smi
-else
-    echo "NVIDIA GPU not detected"
-fi
-```
-
-#### 8. System Temperature
-- Try `sensors` command first (if lm-sensors installed)
-- Fallback to `/sys/class/thermal/thermal_zone0/temp`
-- Convert from millidegrees Celsius to Celsius
-
-#### 9. Alert System (Critical Events)
-- Memory > 90%: Log alert
-- Disk > 90%: Log alert
-- CPU load > number of cores: Log alert
-- All alerts go to log file with timestamp
-
-#### 10. Process Top Users
-- Show top 5 processes by memory consumption
-- Include: PID, user, memory %, command name
-
-### 4. Directory Structure & File Organization
-
-```
-project_root/
-├── system_monitor.sh          # Main script
-├── logs/
-│   └── system_monitor_*.log   # Timestamped logs
-├── reports/
-│   └── report_*.html          # HTML reports with styling
-├── data/
-│   └── metrics_*.csv          # CSV data for historical tracking
-└── README.md                  # Documentation
-```
-
-**File Naming Convention**: All timestamped files use `$(date +%Y%m%d_%H%M%S).log` format
-
-### 5. Logging & Error Handling
-
-**Logging Function**:
-```bash
-log_message() {
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] $1" | tee -a "$LOG_FILE"
+@app.get("/api/metrics/current")
+def current_metrics():
+"""
+Execute the unified bash monitoring script once and return parsed metrics.
+"""
+try:
+result = subprocess.run(
+[SCRIPT_PATH],
+capture_output=True,
+text=True,
+timeout=60,
+)
+if result.returncode != 0:
+return {
+"timestamp": datetime.utcnow().isoformat(),
+"data": None,
+"error": result.stderr.strip() or "script failed",
 }
-```
-
-**Key Requirements**:
-- Every major action logged to file
-- Logs include timestamps
-- Console AND file output (using `tee -a`)
-- Start with separator banner
-- End with completion message
-
-**Error Handling**:
-```bash
-error_handler() {
-    log_message "ERROR: $1"
-    exit 1
+data = parse_stdout(result.stdout)
+return {
+"timestamp": datetime.utcnow().isoformat(),
+"data": data,
+"error": None,
+}
+except Exception as e:
+return {
+"timestamp": datetime.utcnow().isoformat(),
+"data": None,
+"error": str(e),
 }
 
-trap 'error_handler "Unexpected error occurred"' ERR
-```
+text
 
-### 6. CSV Data Export (Historical Tracking)
+`host_api/parse.py`:
 
-**File Format**: Comma-separated with header row
+- Implement `parse_stdout(stdout: str) -> dict`.
+- Map the script’s output (or read its CSV) into a stable JSON structure, e.g.:
 
-**Header**:
-```
-Timestamp,CPU_Usage(%),Memory_Total(GB),Memory_Used(GB),Memory_Free(GB),Memory_Used(%),Disk_Used(%),Process_Count,Load_1m,Uptime_Days
-```
+def parse_stdout(stdout: str) -> dict:
+"""
+Parse system_monitor.sh output into a JSON-friendly dict:
+{
+"cpu": {...},
+"memory": {...},
+"disk": {...},
+"gpu": {...},
+"network": {...},
+"system": {...},
+"rom": {...},
+"top_processes": [...]
+}
+"""
+# TODO: implement based on actual known script output format
+return {}
 
-**Data Row Format**:
-```
-2025-12-10 15:30:45,18,31.38,12.45,18.93,39,52,187,1.25,5
-```
+text
 
-**Implementation**:
-- Create header only if file doesn't exist
-- Append new data on every run
-- Use pipe-delimited format inside functions for easier parsing
-- Convert to CSV in export function
+Run this host API in WSL1 / Linux:
 
-### 7. HTML Report Generation
+cd host_api
+pip install fastapi uvicorn
+uvicorn main:app --host 0.0.0.0 --port 9000
 
-**Must Include**:
-- Responsive design (works on mobile/desktop)
-- Gradient header with project title
-- Color-coded sections for each metric type
-- Progress bars for percentage metrics
-- Professional styling
-- Footer with generation timestamp
+text
 
-**Sections Required**:
-1. System Information (hostname, OS, timestamp, uptime)
-2. CPU Performance (model, cores, usage, load)
-3. Memory Consumption (total, used, free, percentage with progress bar)
-4. Disk Usage (filesystem, total, used, available, percentage with progress bar)
-5. Network Interfaces (table of all interfaces)
-6. Process Information (count, top 5 table)
-7. System Temperature (if available)
-8. GPU Status (if detected)
+Now `http://<host-ip>:9000/api/metrics/current` returns **real metrics**.
 
-**Color Scheme**:
-- Primary gradient: `#667eea` to `#764ba2`
-- Success/healthy: Green
-- Warning: Yellow/orange
-- Critical: Red
+On Docker Desktop, containers can usually reach the Windows/WSL host as `http://host.docker.internal:9000`. (Use that from containers.) [web:347][web:355][web:348]
 
-**Implementation Note**: Use heredoc (`<< 'EOF'`) for HTML template, inject dynamic data with echo
+---
 
-### 8. Main Execution Flow
+## 3. Backend Container – Proxy / Adapter Only
 
-The script MUST execute in this order:
+Now define a backend service inside Docker that **never reads `/proc`** and only calls the host API.
 
-```
-1. Setup (directories, logging)
-2. Environment detection (WSL1 or Linux)
-3. Display header banner
-4. Collect and display each metric [1/10] through [10/10]
-5. Run alert system
-6. Export CSV data
-7. Generate HTML report
-8. Display completion summary with file locations
-9. Log completion message
-```
+### 3.1 Backend structure
 
-**Output Format**:
-```
-[1/10] Collecting CPU Metrics...
-  CPU Model:      [value]
-  CPU Cores:      [value]
-  ...
+backend/
+Dockerfile
+requirements.txt
+app/
+main.py # FastAPI exposing /api/metrics/current for frontend
+metrics_proxy.py # background loop that calls host API
+models.py # Pydantic schemas (optional but nice)
+config.py # read env vars, e.g. HOST_API_BASE_URL, POLL_INTERVAL
 
-[2/10] Collecting Memory Metrics...
-  ...
-```
+text
 
-## Implementation Checklist
+### 3.2 Config
 
-### Code Quality Standards
-- [ ] All functions have descriptive names
-- [ ] Comments above complex sections
-- [ ] Consistent indentation (4 spaces)
-- [ ] No hardcoded paths (use variables)
-- [ ] Graceful error handling (no crashes)
-- [ ] No unquoted variables (use `"$var"`)
-- [ ] Consistent naming convention (snake_case for functions)
+`backend/app/config.py`:
 
-### Cross-Platform Compatibility
-- [ ] Works on WSL1 (tested with `wsl --list --verbose` showing version 1)
-- [ ] Works on native Linux (tested on Ubuntu/Debian/RHEL)
-- [ ] No OS-specific code paths except for `/mnt/c` check
-- [ ] Same script runs on both without modification
-- [ ] No Windows binaries required (except optional nvidia-smi)
+import os
 
-### User Experience
-- [ ] Clear progress indicators ([X/10] format)
-- [ ] All output is readable and organized
-- [ ] Report files are easily accessible
-- [ ] Log files capture all actions
-- [ ] Completion message shows where files are stored
-- [ ] HTML report is beautiful and professional
+HOST_API_BASE_URL = os.getenv("HOST_API_BASE_URL", "http://host.docker.internal:9000")
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "5"))
 
-### Project Deliverables (Arab Academy Requirements)
-- [ ] Bash Monitoring Script (system_monitor.sh)
-- [ ] Error Handling (try-catch equivalent)
-- [ ] Logging Mechanisms (file + console)
-- [ ] Reporting System (HTML + CSV)
-- [ ] Alert System (critical events)
-- [ ] Documentation (README + inline comments)
-- [ ] Code Quality (clean, modular, readable)
+text
 
-## Debugging Tips
+### 3.3 Metrics proxy
 
-### If script fails with "permission denied":
-```bash
-chmod +x system_monitor.sh
-```
+`backend/app/metrics_proxy.py`:
 
-### If `/proc/meminfo` shows wrong values:
-- Verify you're on WSL1: `wsl --list --verbose`
-- If on WSL2, convert: `wsl --set-version Ubuntu 1`
+import requests
+import time
+from datetime import datetime
+from typing import Any, Dict
+from .config import HOST_API_BASE_URL, POLL_INTERVAL_SECONDS
 
-### If CSV export fails:
-- Check if `data/` directory exists
-- Verify write permissions: `touch data/test.txt`
+LATEST: Dict[str, Any] = {
+"timestamp": None,
+"data": None,
+"error": "not started",
+}
 
-### If HTML report doesn't generate:
-- Check if `reports/` directory exists
-- Verify disk space: `df -h`
-- Check permissions: `ls -la reports/`
+def collect_loop():
+global LATEST
+url = f"{HOST_API_BASE_URL}/api/metrics/current"
+while True:
+try:
+r = requests.get(url, timeout=5)
+r.raise_for_status()
+payload = r.json()
+# Normalize: expect host API to return {timestamp, data, error}
+LATEST = {
+"timestamp": datetime.utcnow().isoformat(),
+"data": payload.get("data"),
+"error": payload.get("error"),
+}
+except Exception as e:
+LATEST = {
+"timestamp": datetime.utcnow().isoformat(),
+"data": None,
+"error": str(e),
+}
+time.sleep(POLL_INTERVAL_SECONDS)
 
-### If GPU section shows "No GPU detected":
-- AMD GPUs need amdgpu driver
-- NVIDIA GPUs need nvidia-smi installed
-- This is not fatal; script continues without GPU data
+text
 
-## Integration with Docker (Stage 2)
+### 3.4 FastAPI entrypoint
 
-When containerizing this script, you'll need:
+`backend/app/main.py`:
 
-```dockerfile
-FROM ubuntu:20.04
-RUN apt-get update && apt-get install -y bc sysstat lm-sensors
-COPY system_monitor.sh /app/
+from fastapi import FastAPI
+import threading
+from .metrics_proxy import LATEST, collect_loop
+
+app = FastAPI(title="Monitoring Backend (Proxy)")
+
+@app.on_event("startup")
+def startup_event():
+t = threading.Thread(target=collect_loop, daemon=True)
+t.start()
+
+@app.get("/api/metrics/current")
+def get_current_metrics():
+"""
+Returns the latest metrics fetched from the host API.
+"""
+return LATEST
+
+text
+
+### 3.5 Backend Dockerfile
+
+`backend/Dockerfile`:
+
+FROM python:3.11-slim
+
 WORKDIR /app
-ENTRYPOINT ["./system_monitor.sh"]
-```
 
-Volume mounts:
-```yaml
-volumes:
-  - ./logs:/app/logs
-  - ./reports:/app/reports
-  - ./data:/app/data
-```
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-## Integration with Interactive Dashboard (Stage 3)
+COPY backend/app ./app
 
-For the dialog/whiptail GUI, you can call this script and parse outputs:
+ENV PYTHONUNBUFFERED=1
 
-```bash
-#!/bin/bash
-# dashboard.sh - calls system_monitor.sh and displays results
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
-source ./system_monitor.sh
+text
 
-cpu_usage=$(get_cpu_usage)
-mem_info=$(get_memory_info)
+`backend/requirements.txt`:
 
-whiptail --msgbox "CPU: $cpu_usage%\nMemory: $(echo $mem_info | cut -d'|' -f2) GB used" 10 40
-```
+fastapi
+uvicorn[standard]
+requests
+pydantic
 
-## Testing Checklist
+text
 
-Before final submission:
+---
 
-- [ ] Run script on WSL1
-- [ ] Run script on native Linux (VM or server)
-- [ ] Verify all 10/10 metrics are collected
-- [ ] Check logs directory for errors
-- [ ] Open HTML report in browser
-- [ ] Verify CSV file is properly formatted
-- [ ] Run script twice and verify both reports differ (new timestamps)
-- [ ] Test alert system (create high load or fill disk to 90%+)
-- [ ] Verify no `.exe` files are called in main script
-- [ ] Check for permission errors or crashes
+## 4. Frontend Container – Modern Dashboard
 
-## Project Grading Rubric Alignment
+The existing React/Vite dashboard is fine; just ensure it calls the backend container, not the host.
 
-| Requirement | Score | How to Meet It |
-|-------------|-------|----------------|
-| Bash Monitoring Script (20%) | 2pts | All 10 metrics collected, runs on both OS |
-| Error Handling (10%) | 1pt | Trap errors, graceful fallbacks, no crashes |
-| Logging Mechanisms (10%) | 1pt | Log file with timestamps, all actions logged |
-| Reporting System (20%) | 2pts | HTML + CSV, professional formatting |
-| Alert System (Critical) | Bonus | Check and log critical events |
-| Code Quality (10%) | 1pt | Clean, modular, readable, well-commented |
-| Documentation (10%) | 1pt | Comments in code, README, inline explanations |
-| Presentation (10%) | 1pt | Clear output, professional appearance |
+### 4.1 Requirements
 
-## Key Files to Review
+- React + Vite (or CRA).
+- Modern dark UI, cards, charts (MUI + Recharts, for example).
+- Polls `GET /api/metrics/current` from `http://backend:8000` (service name in Docker network).
 
-When asking Cursor for modifications:
+Configure via env:
 
-1. **Main Script**: `system_monitor.sh`
-   - Location: Root of project
-   - Size: ~800 lines (functions + reports + main)
-   
-2. **Logs**: `logs/system_monitor_*.log`
-   - Shows all actions and errors
-   - Timestamp format: `YYYY-MM-DD HH:MM:SS`
+- In `docker-compose.yml`: `VITE_API_BASE_URL=http://backend:8000`
+- In frontend code: read `import.meta.env.VITE_API_BASE_URL`.
 
-3. **Reports**: `reports/report_*.html`
-   - Open in browser
-   - Contains all metrics with styling
+The response shape from the backend should match what the frontend expects, e.g.:
 
-4. **Data**: `data/metrics_*.csv`
-   - Import into Excel/Sheets for graphing
-   - Track metrics over time
+{
+"timestamp": "2025-12-17T05:00:00Z",
+"data": {
+"cpu": {...},
+"memory": {...},
+"disk": {...},
+"gpu": {...},
+"network": {...},
+"system": {...},
+"rom": {...},
+"top_processes": [...]
+},
+"error": null
+}
 
-## Common Cursor Prompts
+text
 
-### To add a new metric:
-```
-"Add a new function to monitor [X metric]. 
-It should read from /proc/[file] on both WSL1 and Linux. 
-Format the output as pipe-delimited for CSV compatibility."
-```
+Frontend components then bind to `metrics.data.cpu.usage`, etc.
 
-### To improve error handling:
-```
-"Add error handling to the [function name] function. 
-If the file/command doesn't exist, return 'N/A' instead of crashing."
-```
+---
 
-### To add alerting:
-```
-"In the check_critical_alerts() function, add an alert for [condition].
-If [metric] exceeds [threshold], log 'ALERT: [MESSAGE]'."
-```
+## 5. docker-compose – Wiring All Containers
 
-### To modify the HTML report:
-```
-"Update the HTML report template to add a new section for [metric].
-Include a progress bar for percentage metrics and use the existing color scheme."
-```
+At the project root:
 
-## Final Notes
+version: "3.9"
 
-- **Never modify the environment detection logic** - it's the foundation of cross-platform compatibility
-- **Test on both systems** - what works on Linux may not work on WSL1 (permissions, paths)
-- **Use `bc` for floating-point math** - bash only does integers
-- **Quote all variables** - prevents word splitting and globbing errors
-- **Use `-e` flag in grep sparingly** - extended regex may not be portable
-- **Prefer simple tools** - `awk`, `sed`, `grep` over complex one-liners
+services:
+backend:
+build: ./backend
+container_name: monitoring-backend
+ports:
+- "8000:8000"
+environment:
+- HOST_API_BASE_URL=http://host.docker.internal:9000
+- POLL_INTERVAL_SECONDS=5
+networks:
+- monitor-net
 
-## References
+frontend:
+build: ./frontend
+container_name: monitoring-frontend
+ports:
+- "3000:80" # if serving via nginx; or 3000:3000 for dev server
+environment:
+- VITE_API_BASE_URL=http://backend:8000
+networks:
+- monitor-net
 
-- WSL1 Architecture: Translation layer, thin virtualization
-- `/proc` Filesystem: Linux kernel interface
-- Bash Best Practices: Shellcheck recommendations
-- Project Deadline: November 13th (or agreed upon date)
-- Grading Rubric: 100 points total across 7 categories
+networks:
+monitor-net:
+driver: bridge
+
+text
+
+Assumptions:
+
+- Host API runs at `http://0.0.0.0:9000` on WSL1 / Linux.
+- Docker Desktop provides `host.docker.internal` mapping to host network. [web:347][web:355][web:348]
+
+---
+
+## 6. What You Must Generate
+
+Given this prompt, you should:
+
+1. Create **host-side FastAPI** files (`host_api/main.py`, `host_api/parse.py`) that:
+   - Execute `system_monitor.sh`.
+   - Parse its output into a stable JSON structure.
+   - Expose `GET /api/metrics/current`.
+
+2. Create **backend** folder (`backend/`) that:
+   - Implements `metrics_proxy.py` as above.
+   - Implements `main.py` as above.
+   - Includes `Dockerfile` and `requirements.txt`.
+
+3. Ensure **frontend**:
+   - Uses `VITE_API_BASE_URL` to call backend.
+   - Renders modern, interactive cards and charts for CPU, memory, disk, GPU, network, system info, and top processes.
+
+4. Provide a concise **README** describing:
+   - How to run host API in WSL1 / Linux.
+   - How to run `docker-compose up`.
+   - How the data flow works (host script → host API → backend → frontend).
+
+The key goal is to keep the **trusted bash script** as the single source of real metrics and have Docker‑based backend/frontend only **consume** and **visualize** those metrics, never trying to read `/proc` directly inside containers.

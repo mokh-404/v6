@@ -365,123 +365,232 @@ collect_smart_status() {
 collect_network_metrics() {
     log_info "[6/9] Collecting Network Metrics (Speed)..."
 
-
     local net_info=""
-    local found=0
-    
-    # Aggregators (Bytes/s)
-    local lan_rx_total=0
-    local lan_tx_total=0
-    local wifi_rx_total=0
-    local wifi_tx_total=0
-
     local current_time=$(date +%s.%N)
     
-    # Process Linux/WSL (/proc/net/dev)
-    if [ -r /proc/net/dev ]; then
-        local raw=$(cat /proc/net/dev | tail -n +3)
-        
-        # Calculate time delta if we have a previous time
-        local time_delta=0
-        if [ "$PREV_NET_TIME" != "0" ]; then
-             time_delta=$(echo "$current_time $PREV_NET_TIME" | awk '{print $1 - $2}')
-        fi
-        
-        while read -r line; do
-             # Trim
-             line=$(echo "$line" | sed 's/^[ \t]*//')
-             [ -z "$line" ] && continue
-             
-             local name=$(echo "$line" | cut -d: -f1)
-             [ "$name" = "lo" ] && continue
-             
-             local stats=$(echo "$line" | cut -d: -f2)
-             local rx=$(echo "$stats" | awk '{print $1}')
-             local tx=$(echo "$stats" | awk '{print $9}')
-             
-             # If we have previous data for this interface AND valid time delta
-             if [ -n "${PREV_NET_RX[$name]}" ] && [ $(echo "$time_delta" | awk '{if ($1 > 0.1) print 1; else print 0}') -eq 1 ]; then
-                 local rx_delta=$((rx - PREV_NET_RX[$name]))
-                 local tx_delta=$((tx - PREV_NET_TX[$name]))
-                 
-                 # Handle counter wrap (optional, but good practice) or negative? 
-                 # Usually unnecessary for simple monitor, but let's just ensure positive.
-                 [ "$rx_delta" -lt 0 ] && rx_delta=0
-                 [ "$tx_delta" -lt 0 ] && tx_delta=0
-                 
-                 local rx_rate=$(echo "$rx_delta $time_delta" | awk '{printf "%.0f", $1 / $2}')
-                 local tx_rate=$(echo "$tx_delta $time_delta" | awk '{printf "%.0f", $1 / $2}')
-
-                 if [[ "$name" =~ ^w|^wifi ]]; then
-                     wifi_rx_total=$(echo "$wifi_rx_total $rx_rate" | awk '{print $1 + $2}')
-                     wifi_tx_total=$(echo "$wifi_tx_total $tx_rate" | awk '{print $1 + $2}')
-                 else
-                     lan_rx_total=$(echo "$lan_rx_total $rx_rate" | awk '{print $1 + $2}')
-                     lan_tx_total=$(echo "$lan_tx_total $tx_rate" | awk '{print $1 + $2}')
-                 fi
-                 found=1 # We found and calculated for at least one interface
-             else
-                 # First run or new interface: just mark found=1 so we don't show "Not found" error
-                 # but rates remain 0
-                 found=1
-             fi
-             
-             # Update state
-             PREV_NET_RX[$name]=$rx
-             PREV_NET_TX[$name]=$tx
-             
-        done <<< "$raw"
-    fi
-    # Wait, the get_bytes function is now unused, I should assume I can remove it or inline it?
-    # I replaced the usage logic above.
-    
-    # Save state time
-    PREV_NET_TIME="$current_time"
-    
-    # Formatting Helper
+    # --------------------------------------------------------------------------
+    # 0. Formatting Helper (Moved up for shared use)
+    # --------------------------------------------------------------------------
     format_speed() {
         local bytes=$1
-        # Use awk for comparison and formatting in one go to handle all logic safely
         echo "$bytes" | awk '{
-            if ($1 < 1024) {
-                printf "%.0f B/s", $1
-            } else if ($1 < 1048576) {
-                printf "%.2f KB/s", $1/1024
-            } else {
-                printf "%.2f MB/s", $1/1048576
-            }
+            if ($1 < 1024) { printf "%.0f B/s", $1 } 
+            else if ($1 < 1048576) { printf "%.2f KB/s", $1/1024 } 
+            else { printf "%.2f MB/s", $1/1048576 }
         }'
     }
 
-    if [ $found -eq 1 ]; then
-        local lan_rx_disp=$(format_speed $lan_rx_total)
-        local lan_tx_disp=$(format_speed $lan_tx_total)
-        local wifi_rx_disp=$(format_speed $wifi_rx_total)
-        local wifi_tx_disp=$(format_speed $wifi_tx_total)
+    # 1. TCP Connections (Always reliable)
+    # --------------------------------------------------------------------------
+    local tcp_conns=0
+    if [ -r /proc/net/tcp ]; then
+        local raw=$(cat /proc/net/tcp | wc -l)
+        tcp_conns=$((raw - 1))
+        [ $tcp_conns -lt 0 ] && tcp_conns=0
+    fi
+    
+    # --------------------------------------------------------------------------
+    # STRATEGY D: Windows Native (typeperf.exe) - The "Fix" for Frozen WSL1
+    # --------------------------------------------------------------------------
+    # Use this if available (WSL environ) as it bypasses broken Linux counters entirely.
+    if command -v typeperf.exe >/dev/null 2>&1; then
+        # Run typeperf for 1 snapshot (instant rate).
+        local raw_win=$(typeperf.exe "\Network Interface(*)\Bytes Received/sec" "\Network Interface(*)\Bytes Sent/sec" -sc 1 2>/dev/null)
         
-        local output_str=""
-        
-        # In WSL, physical WiFi usually appears as 'eth0' alongside Ethernet.
-        # It's indistinguishable. So we should simplify the label to avoid "WiFi: 0 B/s" confusion.
-        if is_wsl; then
-             local total_rx=$((lan_rx_total + wifi_rx_total))
-             local total_tx=$((lan_tx_total + wifi_tx_total))
-             local disp_rx=$(format_speed $total_rx)
-             local disp_tx=$(format_speed $total_tx)
-             output_str="  Network (WSL): ↓ ${disp_rx}  ↑ ${disp_tx}"
-        else
-             # Standard Linux separate display
-             output_str="  LAN: ↓ ${lan_rx_disp}  ↑ ${lan_tx_disp}"
-             # Only show WiFi if it actually exists/has been detected or non-zero? 
-             # User prompt showed "wifi: 0 B/s".
-             # Let's keep showing it but if it's 0 and we are not in WSL, maybe keep it 0.
-             output_str="${output_str} | wifi: ↓ ${wifi_rx_disp}  ↑ ${wifi_tx_disp}"
+        if [ -n "$raw_win" ]; then
+            # Use awk to parse the CSV safely
+            read l_rx l_tx w_rx w_tx <<< $(echo "$raw_win" | awk -F '","' '
+            NR==2 {
+                # Header Parsing
+                for(i=2; i<=NF; i++) {
+                    if($i ~ /Wi-Fi|Wireless|WLAN|802\.11/) type="wifi"
+                    else type="lan"
+                    
+                    if($i ~ /Received/) dir="rx"
+                    else if($i ~ /Sent/) dir="tx"
+                    else dir="ignore"
+                    
+                    map[i] = type "_" dir
+                }
+            }
+            NR==3 {
+                # Data Parsing
+                lr=0; lt=0; wr=0; wt=0;
+                for(i=2; i<=NF; i++) {
+                     val=$i
+                     gsub(/"/, "", val) 
+                     if(map[i] == "lan_rx") lr += val
+                     if(map[i] == "lan_tx") lt += val
+                     if(map[i] == "wifi_rx") wr += val
+                     if(map[i] == "wifi_tx") wt += val
+                }
+                printf "%.0f %.0f %.0f %.0f", lr, lt, wr, wt
+            }
+            ')
+            
+            # If we got any numbers (even 0 is valid return from successful parse)
+            # We assume this source is authoritative for WSL.
+            if [ -n "$l_rx" ]; then
+                 local d_lrx=$(format_speed $l_rx)
+                 local d_ltx=$(format_speed $l_tx)
+                 local d_wrx=$(format_speed $w_rx)
+                 local d_wtx=$(format_speed $w_tx)
+                 
+                 METRICS[NET_DATA]="  LAN: ↓ ${d_lrx} ↑ ${d_ltx} | WiFi: ↓ ${d_wrx} ↑ ${d_wtx} | TCP: ${tcp_conns}"
+                 return
+            fi
         fi
-        
-        # Echo removed
-        METRICS[NET_DATA]="$output_str"
+    fi
+
+    # --------------------------------------------------------------------------
+    # STRATEGY E: MacOS Native (Darwin)
+    # --------------------------------------------------------------------------
+    if [ "$(uname -s)" = "Darwin" ] && command -v netstat >/dev/null 2>&1; then
+          # netstat -ib: 
+          # Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll
+          # 1    2   3       4       5     6     7      8     9     10     11
+          local content=$(netstat -ib -n 2>/dev/null)
+          
+          local lan_rx=0; local lan_tx=0; local wifi_rx=0; local wifi_tx=0;
+          local active=0
+          
+          # Calc Delta
+          local time_delta=0
+          local valid_delta=0
+          if [ "$PREV_NET_TIME" != "0" ]; then
+             time_delta=$(echo "$current_time $PREV_NET_TIME" | awk '{print $1 - $2}')
+             if [ $(echo "$time_delta" | awk '{if ($1 > 0.1) print 1; else print 0}') -eq 1 ]; then valid_delta=1; fi
+          fi
+
+          # Parse
+          while read -r line; do
+             # Filter Header
+             [[ "$line" =~ ^Name ]] && continue
+             
+             # Filter only Link Layer (Lines containing <Link#...>)
+             if [[ "$line" =~ "<Link#" ]]; then
+                 # awk default split by whitespace
+                 local name=$(echo "$line" | awk '{print $1}')
+                 local rx=$(echo "$line" | awk '{print $7}')
+                 local tx=$(echo "$line" | awk '{print $10}')
+                 
+                 # On Mac, en0, en1 are physical. en0 usually WiFi on laptops, Ethernet on Mac Mini.
+                 # Hardware Port checking is complex. We assume 'en' is LAN/WiFi. 
+                 # Often en0=WiFi. bridge0=Bridge.
+                 # Simple heuristic: en* = WiFi (MacBooks) or LAN. 
+                 # Let's aggregate 'en' as we don't know enabling.
+                 # Actually, usually en0 is WiFi. en1 is Thunderbolt?
+                 
+                 # Better: just check 'en'. 
+                 if [[ "$name" =~ ^en ]]; then
+                     # Accumulate
+                     if [ "$valid_delta" -eq 1 ] && [ -n "${PREV_NET_RX[$name]}" ]; then
+                         local rd=$((rx - PREV_NET_RX[$name]))
+                         local td=$((tx - PREV_NET_TX[$name]))
+                         [ "$rd" -lt 0 ] && rd=0; [ "$td" -lt 0 ] && td=0;
+                         local rr=$(echo "$rd $time_delta" | awk '{printf "%.0f", $1 / $2}')
+                         local tr=$(echo "$td $time_delta" | awk '{printf "%.0f", $1 / $2}')
+                         
+                         # On Mac, separating LAN/WiFi is tricky without 'networksetup'.
+                         # We'll enable a naive split: en0 is usually primary.
+                         # If we see 'en0' we call it WiFi (Macbook default).
+                         # If name has 'bridge', skip?
+                         # Let's map ALL 'en' traffic to "Net".
+                         # Or better, user wants Split.
+                         # We can try using system_profiler in background? Too slow.
+                         # We'll just Aggregate all 'en' to LAN for now, or Split en0/en1?
+                         # Let's dump all to "Net".
+                         lan_rx=$((lan_rx+rr))
+                         lan_tx=$((lan_tx+tr))
+                     fi
+                     PREV_NET_RX[$name]=$rx; PREV_NET_TX[$name]=$tx;
+                 fi
+             fi
+          done <<< "$content"
+          
+          if [ $((lan_rx+lan_tx)) -gt 0 ]; then active=1; fi
+          
+          METRICS[NET_DATA]="  Net(Mac): ↓ $(format_speed $lan_rx) ↑ $(format_speed $lan_tx) | TCP: ${tcp_conns}"
+          if [ "$active" -eq 1 ]; then
+             PREV_NET_TIME="$current_time"
+             return
+          fi
+    fi
+
+    # --------------------------------------------------------------------------
+    # STRATEGY A/B/C: Linux Native Fallbacks (Native Linux / Broken WSL)
+    # --------------------------------------------------------------------------
+    
+    local time_delta=0
+    local valid_delta=0
+    if [ "$PREV_NET_TIME" != "0" ]; then
+         time_delta=$(echo "$current_time $PREV_NET_TIME" | awk '{print $1 - $2}')
+         if [ $(echo "$time_delta" | awk '{if ($1 > 0.1) print 1; else print 0}') -eq 1 ]; then
+             valid_delta=1
+         fi
+    fi
+
+    # --- Source A: SNMP (Global) ---
+    local snmp_rx=0; local snmp_tx=0; local snmp_active=0;
+    if [ -r /proc/net/snmp ]; then
+         read snmp_rx snmp_tx <<< $(awk '/^Ip:/{i++; if(i==2) print $3, $10}' /proc/net/snmp)
+         if [ -n "$snmp_rx" ] && [ "$valid_delta" -eq 1 ] && [ -n "${PREV_NET_RX[TOTAL_SNMP]}" ]; then
+             local rd=$((snmp_rx - PREV_NET_RX[TOTAL_SNMP])); local td=$((snmp_tx - PREV_NET_TX[TOTAL_SNMP]));
+             [ "$rd" -lt 0 ] && rd=0; [ "$td" -lt 0 ] && td=0;
+             local rr=$(echo "$rd $time_delta" | awk '{printf "%.0f", $1 / $2}'); local tr=$(echo "$td $time_delta" | awk '{printf "%.0f", $1 / $2}');
+             snmp_rx=$((rr * 1024)); snmp_tx=$((tr * 1024));
+             [ $((snmp_rx+snmp_tx)) -gt 0 ] && snmp_active=1;
+         fi
+         if [ -n "$snmp_rx" ]; then PREV_NET_RX[TOTAL_SNMP]=$snmp_rx; PREV_NET_TX[TOTAL_SNMP]=$snmp_tx; fi
+    fi
+
+    # --- Source B: Interface Counters ---
+    local iface_file=""; local iface_mode="";
+    if [ -r /proc/net/dev ]; then iface_file="/proc/net/dev"; iface_mode="std";
+    elif [ -r /proc/net/xt_qtaguid/iface_stat_fmt ]; then iface_file="/proc/net/xt_qtaguid/iface_stat_fmt"; iface_mode="legacy"; fi
+    
+    local lan_rx=0; local lan_tx=0; local wifi_rx=0; local wifi_tx=0; local iface_active=0; local iface_found=0;
+    
+    if [ -n "$iface_file" ]; then
+        iface_found=1
+        local content=$(cat "$iface_file")
+        [ "$iface_mode" = "std" ] && content=$(echo "$content" | tail -n +3)
+        while read -r line; do
+             line=$(echo "$line" | sed 's/^[ \t]*//')
+             [ -z "$line" ] && continue
+             local name rx tx
+             if [ "$iface_mode" = "std" ]; then name=$(echo "$line"|cut -d: -f1); local s=$(echo "$line"|cut -d: -f2); rx=$(echo "$s"|awk '{print $1}'); tx=$(echo "$s"|awk '{print $9}');
+             else name=$(echo "$line"|awk '{print $1}'); [ "$name" = "ifname" ] && continue; rx=$(echo "$line"|awk '{print $2}'); tx=$(echo "$line"|awk '{print $4}'); fi
+             [ "$name" = "lo" ] && continue; [ -z "$rx" ] && continue
+             
+             if [ "$valid_delta" -eq 1 ] && [ -n "${PREV_NET_RX[$name]}" ]; then
+                 local rd=$((rx - PREV_NET_RX[$name])); local td=$((tx - PREV_NET_TX[$name]));
+                 [ "$rd" -lt 0 ] && rd=0; [ "$td" -lt 0 ] && td=0;
+                 local rr=$(echo "$rd $time_delta" | awk '{printf "%.0f", $1 / $2}'); local tr=$(echo "$td $time_delta" | awk '{printf "%.0f", $1 / $2}');
+                 if [[ "$name" =~ ^w|^wifi ]]; then wifi_rx=$((wifi_rx+rr)); wifi_tx=$((wifi_tx+tr));
+                 else lan_rx=$((lan_rx+rr)); lan_tx=$((lan_tx+tr)); fi
+             fi
+             PREV_NET_RX[$name]=$rx; PREV_NET_TX[$name]=$tx;
+        done <<< "$content"
+        if [ $((lan_rx+lan_tx+wifi_rx+wifi_tx)) -gt 0 ]; then iface_active=1; fi
+    fi
+
+    PREV_NET_TIME="$current_time"
+    
+    # Selection Logic
+    if [ "$iface_active" -eq 1 ]; then
+        local label=""; [ "$iface_mode" = "legacy" ] && label="(L)"
+        METRICS[NET_DATA]="  LAN${label}: ↓ $(format_speed $lan_rx) ↑ $(format_speed $lan_tx) | WiFi: ↓ $(format_speed $wifi_rx) ↑ $(format_speed $wifi_tx) | TCP: ${tcp_conns}"
+    elif [ "$snmp_active" -eq 1 ]; then
+        METRICS[NET_DATA]="  Net(Global): ↓ $(format_speed $snmp_rx)  ↑ $(format_speed $snmp_tx) | TCP: ${tcp_conns}"
     else
-        METRICS[NET_DATA]="No network interfaces found"
+        # Default Zero
+        if [ "$iface_found" -eq 1 ]; then
+            local label=""; [ "$iface_mode" = "legacy" ] && label="(L)"
+            METRICS[NET_DATA]="  LAN${label}: ↓ 0 B/s ↑ 0 B/s | WiFi: ↓ 0 B/s ↑ 0 B/s | TCP: ${tcp_conns}"
+        else
+            METRICS[NET_DATA]="  Net: Initializing... | TCP: ${tcp_conns}"
+        fi
     fi
 }
 
@@ -507,6 +616,68 @@ collect_load_metrics() {
     METRICS[PROC_COUNT]="$proc_cnt"
     
     # Echo removed
+}
+
+# [8/10] ROM/BIOS Metrics
+collect_rom_metrics() {
+    log_info "[4/9] Collecting ROM/BIOS Info..."
+    
+    local vendor="N/A"
+    local version="N/A"
+    local date="N/A"
+    local serial="N/A"
+    local secure_boot="N/A"
+    
+    # Strategy A: WSL/Windows (wmic)
+    if command -v wmic.exe >/dev/null 2>&1; then
+        # Parse wmic output (format:list)
+        local raw=$(wmic.exe bios get /format:list 2>/dev/null | tr -d '\r')
+        if [ -n "$raw" ]; then
+             vendor=$(echo "$raw" | grep "^Manufacturer=" | cut -d= -f2)
+             version=$(echo "$raw" | grep "^SMBIOSBIOSVersion=" | cut -d= -f2)
+             local d_raw=$(echo "$raw" | grep "^ReleaseDate=" | cut -d= -f2)
+             serial=$(echo "$raw" | grep "^SerialNumber=" | cut -d= -f2)
+             
+             # Date format: 20241203000000.000000+000 -> 2024-12-03
+             if [ -n "$d_raw" ]; then
+                 date="${d_raw:0:4}-${d_raw:4:2}-${d_raw:6:2}"
+             fi
+        fi
+        
+        # Check Secure Boot (Powershell)
+        if command -v powershell.exe >/dev/null 2>&1; then
+             local sb_status=$(powershell.exe -Command "Confirm-SecureBootUEFI" 2>/dev/null | tr -d '\r')
+             if [[ "$sb_status" == "True" ]]; then secure_boot="Enabled"; 
+             elif [[ "$sb_status" == "False" ]]; then secure_boot="Disabled"; 
+             else secure_boot="Unknown"; fi
+        fi
+        
+    # Strategy B: Linux Native (sysfs)
+    elif [ -r /sys/class/dmi/id/bios_vendor ]; then
+        vendor=$(cat /sys/class/dmi/id/bios_vendor 2>/dev/null)
+        version=$(cat /sys/class/dmi/id/bios_version 2>/dev/null)
+        date=$(cat /sys/class/dmi/id/bios_date 2>/dev/null)
+        serial=$(cat /sys/class/dmi/id/product_serial 2>/dev/null)
+        # Secure Boot on Linux usually requires 'mokutil' or root access to efivars
+        if command -v mokutil >/dev/null 2>&1; then
+            if mokutil --sb-state 2>/dev/null | grep -q "SecureBoot enabled"; then secure_boot="Enabled"; else secure_boot="Disabled"; fi
+        fi
+        
+    # Strategy C: MacOS (system_profiler)
+    elif [ "$(uname -s)" = "Darwin" ]; then
+        local raw=$(system_profiler SPHardwareDataType 2>/dev/null)
+        version=$(echo "$raw" | grep "System Firmware Version:" | cut -d: -f2 | xargs)
+        serial=$(echo "$raw" | grep "Serial Number (system):" | cut -d: -f2 | xargs)
+        vendor="Apple"
+        if echo "$raw" | grep -q "Apple Security Chip"; then secure_boot="Enabled"; fi
+    fi
+    # Clean up empty
+    [ -z "$vendor" ] && vendor="N/A"
+    [ -z "$version" ] && version="N/A"
+    [ -z "$date" ] && date="N/A"
+    [ -z "$serial" ] && serial="N/A"
+    
+    METRICS[ROM_INFO]="${vendor} | Ver: ${version} | Date: ${date} | Serial: ${serial} | SB: ${secure_boot}"
 }
 
 # [7/10] GPU Metrics
@@ -720,98 +891,183 @@ EOF
 }
 
 display_summary() {
-    echo ""
-    echo "================================================================================"
-    echo "  System Summary [$TIMESTAMP]"
-    echo "================================================================================"
+    # Clear screen (ANSI)
+    printf "\033[H\033[J"
     
-    # Line A: Alerts (if any)
-    if [ -n "${METRICS[ALERTS]}" ] && [ "${METRICS[ALERTS]}" != "No alerts." ]; then
-        echo "  [!] ALERTS: ${METRICS[ALERTS]}"
-        echo "  ------------------------------------------------------------------------------"
-    fi
-    
-    # Line 1: CPU | Memory
-    local cpu_str="CPU: ${METRICS[CPU_MODEL]} | Cores: ${METRICS[CPU_CORES]} | Usage: ${METRICS[CPU_USAGE]}% | Load: ${METRICS[LOAD_AVG]} | Temp: ${METRICS[TEMP]}"
-    local mem_str="Mem: ${METRICS[MEM_USED]}/${METRICS[MEM_TOTAL]} GB (${METRICS[MEM_PERCENT]}%) | Free: ${METRICS[MEM_FREE]} GB"
-    echo "  $cpu_str | $mem_str"
-    echo "  ------------------------------------------------------------------------------"
+    # Ensure ROM has a value if empty
+    [ -z "${METRICS[ROM_INFO]}" ] && METRICS[ROM_INFO]="Loading ROM Data..."
 
-    # Line 2: GPU | Disk
-    local gpu_str="GPU: ${METRICS[GPU_NAME]} | Mem: ${METRICS[GPU_MEM]} | Util: ${METRICS[GPU_UTIL]} | Temp: ${METRICS[GPU_TEMP]}"
-    local disk_str="${METRICS[DISK_DISPLAY]}" # Already format "Disks: [..] | ..."
-    # Remove leading spaces from disk string if any
-    disk_str=$(echo "$disk_str" | sed 's/^[ \t]*//')
-    echo "  $gpu_str | $disk_str"
+    echo "================================================================================"
+    echo "  System Summary [${TIMESTAMP}]"
+    echo "================================================================================"
+    echo "  CPU: ${METRICS[CPU_MODEL]} | Cores: ${METRICS[CPU_CORES]} | Usage: ${METRICS[CPU_USAGE]} | Load: ${METRICS[LOAD_AVG]} | Temp: ${METRICS[TEMP]} | Mem: ${METRICS[MEM_USED]}/${METRICS[MEM_TOTAL]} GB (${METRICS[MEM_PERCENT]}) | Free: ${METRICS[MEM_FREE]} GB"
     echo "  ------------------------------------------------------------------------------"
-    
-    # Line 3: System | Network
-    # Network string usually starts with "  LAN:..."
-    local net_str="${METRICS[NET_DATA]}"
-    net_str=$(echo "$net_str" | sed 's/^[ \t]*//')
-    
-    local sys_str="System: Uptime: ${METRICS[UPTIME]} | Procs: ${METRICS[PROC_COUNT]} | SMART: ${METRICS[SMART_HEALTH]}"
-    
-    echo "  $sys_str | $net_str"
+    echo "  GPU: ${METRICS[GPU_NAME]} | Mem: ${METRICS[GPU_MEM]} | Util: ${METRICS[GPU_UTIL]} | Temp: ${METRICS[GPU_TEMP]} | Disks: ${METRICS[DISK_DISPLAY]}"
+    echo "  ------------------------------------------------------------------------------"
+    echo "  System: Uptime: ${METRICS[UPTIME]} | Procs: ${METRICS[PROC_COUNT]} | SMART: ${METRICS[SMART_STATUS]}"
+    echo "  ROM: ${METRICS[ROM_INFO]}"
+    echo "  ${METRICS[NET_DATA]}"
     echo ""
-    
-    # Top Processes
-    if [ -n "${METRICS[TOP_PROCS]}" ]; then
-        echo "  Top Processes:"
-        echo "  PID    USER     MEM%   COMMAND"
-        # Since we stored a raw string with semicolons earlier for internal use,
-        # we might need to reconstruct the nice table or just use the variable we formatted (?)
-        # Wait, collect_top_processes does NOT store the pretty table in METRICS[TOP_PROCS], 
-        # it stores "pid user mem cmd;" list. 
-        # But it WAS echoing the table. I must check if I removed the table echoes.
-        # I did not modify collect_top_processes in the previous multi_replace.
-        # I should probably let collect_top_processes print itself OR output it here.
-        # Let's adjust collect_top_processes to NOT print and do it here.
-        
-        IFS=';' read -ra PROCS <<< "${METRICS[TOP_PROCS]}"
-        for proc in "${PROCS[@]}"; do
-             [ -z "$proc" ] && continue
-             # proc: "pid user mem% cmd"
-             local p=$(echo "$proc" | awk '{print $1}')
-             local u=$(echo "$proc" | awk '{print $2}')
-             local m=$(echo "$proc" | awk '{print $3}')
-             local c=$(echo "$proc" | cut -d' ' -f4-)
-             printf "  %-6s %-8s %-6s %s\n" "$p" "$u" "$m" "$c"
-        done
-        echo ""
-    fi
 }
 
 ################################################################################
 # Main
 ################################################################################
 
+# Async Helpers
+run_async() {
+    local func_name=$1
+    local out_file=$2
+    local lock_file="${out_file}.lock"
+    
+    # Check if lock exists and process is still running
+    if [ -f "$lock_file" ]; then
+        local pid=$(cat "$lock_file")
+        if kill -0 "$pid" 2>/dev/null; then
+            return # Still running, skip
+        fi
+    fi
+    
+    # Start background job
+    (
+        echo $$ > "$lock_file"
+        $func_name > "$out_file.tmp"
+        mv "$out_file.tmp" "$out_file"
+        rm -f "$lock_file"
+    ) &
+}
+
+load_async_metric() {
+    local file=$1
+    local metric_key=$2
+    if [ -f "$file" ]; then
+        METRICS[$metric_key]=$(cat "$file")
+    else
+        METRICS[$metric_key]="Loading..."
+    fi
+}
+
+# Refactored Heavy Functions (Output to stdout)
+get_smart_output() {
+    collect_smart_status_logic
+    echo "${METRICS[SMART_STATUS]}|${METRICS[SMART_HEALTH]}"
+}
+
+get_disk_output() {
+    collect_disk_metrics_logic
+    echo "${METRICS[DISK_DISPLAY]}"
+}
+
+get_gpu_output() {
+    collect_gpu_metrics_logic
+    echo "${METRICS[GPU_NAME]}|${METRICS[GPU_MEM]}|${METRICS[GPU_TEMP]}|${METRICS[GPU_UTIL]}"
+}
+
+# Wrapper to keep original logic but redirect output appropriately
+wrapper_smart() {
+    collect_smart_status
+    echo "${METRICS[SMART_HEALTH]}" 
+}
+wrapper_disk() {
+    collect_disk_metrics
+    echo "${METRICS[DISK_PERCENT]}"
+    echo "${METRICS[DISK_DISPLAY]}"
+}
+wrapper_gpu() {
+    collect_gpu_metrics
+    echo "${METRICS[GPU_NAME]}|${METRICS[GPU_MEM]}|${METRICS[GPU_TEMP]}|${METRICS[GPU_UTIL]}"
+}
+
 main() {
     setup_directories
     display_header
     
+    local tick=0
+    
+    # Initial Collections (Static Data)
+    collect_rom_metrics         # [NEW] ROM/BIOS
+    
+    # Define temp files
+    local smart_file="/tmp/sysmon_smart.data"
+    local disk_file="/tmp/sysmon_disk.data"
+    local gpu_file="/tmp/sysmon_gpu.data"
+    
     while true; do
-        # Update timestamp for each iteration so logs/reports are accurate
         TIMESTAMP=$(date +%Y%m%d_%H%M%S)
         
+        # --- FAST METRICS ---
         collect_cpu_metrics
         collect_memory_metrics
-        collect_gpu_metrics
-        collect_disk_metrics
-        collect_smart_status    # Grouped next to Disk
         collect_network_metrics
         collect_load_metrics    
-        
         collect_top_processes
-        check_alerts
+        
+        # --- ASYNC SCHEDULING ---
+        # Trigger background jobs
+        
+        # GPU (Every 5s) - Using wrapper to dump data to file
+        if [ $((tick % 5)) -eq 0 ]; then
+             run_async "wrapper_gpu" "$gpu_file"
+        fi
+        
+        # Disk (Every 10s)
+        if [ $((tick % 10)) -eq 0 ]; then
+             run_async "wrapper_disk" "$disk_file"
+        fi
+        
+        # SMART (Every 30s)
+        if [ $((tick % 30)) -eq 0 ]; then
+             run_async "wrapper_smart" "$smart_file"
+        fi
+
+        # Alerts (Every 5s - Fast enough to run sync?)
+        
+        # Simplification: READ the async files and populate METRICS
+        
+        if [ -f "$gpu_file" ]; then
+             IFS='|' read -r name mem temp util < "$gpu_file"
+             METRICS[GPU_NAME]="$name"
+             METRICS[GPU_MEM]="$mem"
+             METRICS[GPU_TEMP]="$temp"
+             METRICS[GPU_UTIL]="$util"
+        else
+             METRICS[GPU_NAME]="Loading..."
+        fi
+        
+        if [ -f "$disk_file" ]; then
+             # Read multiple lines: 1st=Percent, 2nd=Display
+             {
+                 read -r d_pct
+                 read -r d_disp
+             } < "$disk_file"
+             METRICS[DISK_PERCENT]="$d_pct"
+             METRICS[DISK_DISPLAY]="$d_disp"
+        else
+             METRICS[DISK_DISPLAY]="Loading..."
+        fi
+        
+        if [ -f "$smart_file" ]; then
+             METRICS[SMART_HEALTH]=$(cat "$smart_file")
+        else
+             METRICS[SMART_HEALTH]="Loading..."
+        fi
+        
+        # Alerts (Sync) - using whatever data we have
+        if [ $((tick % 5)) -eq 0 ]; then
+            check_alerts
+        fi
         
         export_csv
         generate_html
         
         display_summary
         
-        sleep 5
+        sleep 1
+        ((tick++))
     done
 }
 
-main
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main
+fi
+```
